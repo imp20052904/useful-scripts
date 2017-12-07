@@ -26,7 +26,7 @@ readonly USER="`whoami`"
 usage() {
     [ -n "$1" -a "$1" != 0 ] && local out=/dev/stderr || local out=/dev/stdout
 
-    > $out cat <<EOF
+    cat <<EOF
 Usage: ${PROG} [OPTION]... [delay [count]]
 Find out the highest cpu consumed threads of java, and print the stack of these threads.
 
@@ -45,6 +45,8 @@ Options:
                             use when jstack <pid> does not respond (process is hung)
   -m, --mix-native-frames   set jstack to print both java and native frames (mixed mode)
   -l, --lock-info           set jstack with long listing. Prints additional information about locks
+  --cpu_period              period of time for collecting cpu stats, in secs, default 2 (this option is valid only when --current option is set)
+  --current                 use current cpu stats rather than that since start
   -h, --help                display this help and exit
   delay                     the delay between updates in seconds
   count                     the number of updates
@@ -58,7 +60,7 @@ EOF
 # parse options
 ################################################################################
 
-readonly ARGS=`getopt -n "$PROG" -a -o p:c:a:s:Fmlh -l count:,pid:,append-file:,jstack-path:,force,mix-native-frames,lock-info,help -- "$@"`
+readonly ARGS=`getopt -n "$PROG" -a -o p:c:a:s:Fmlh -l count:,pid:,append-file:,jstack-path:,cpu_period:,current,force,mix-native-frames,lock-info,help -- "$@"`
 [ $? -ne 0 ] && usage 1
 eval set -- "${ARGS}"
 
@@ -92,6 +94,14 @@ while true; do
         more_lock_info=-l
         shift 1
         ;;
+    --cpu_period)
+        cpu_period="$2"
+        shift 2
+        ;;
+    --current)
+        current=1;
+        shift 1
+        ;;        
     -h|--help)
         usage
         ;;
@@ -102,6 +112,7 @@ while true; do
     esac
 done
 count=${count:-5}
+cpu_period=${cpu_period:-2}
 
 update_delay=${1:-0}
 [ -z "$1" ] && update_count=1 || update_count=${2:-0}
@@ -157,6 +168,7 @@ if [ -n "$jstack_path" ]; then
         exit 1
     }
 elif which jstack &> /dev/null; then
+    # Check the existence of jstack command!
     jstack_path="`which jstack`"
 else
     [ -z "$JAVA_HOME" ] && {
@@ -192,8 +204,8 @@ printStackOfThreads() {
         local pid=${line[0]}
         local threadId=${line[1]}
         local threadId0x="0x`printf %x ${threadId}`"
-        local pcpu=${line[3]}
-        local user=${line[4]}
+        local user=${line[2]}
+        local pcpu=${line[4]}
 
         ((counter++))
         local jstackFile=/tmp/${uuid}_${pid}
@@ -204,14 +216,14 @@ printStackOfThreads() {
                 elif [ $UID == 0 ]; then
                     sudo -u "${user}" "$jstack_path" ${force} $mix_native_frames $more_lock_info ${pid} > ${jstackFile}
                 else
-                    redPrint "[$counter] Fail to jstack busy(${pcpu}%) thread(${threadId}/${threadId0x}) stack of java process(${pid}) under user(${user})."
+                    redPrint "[$counter] Fail to jstack Busy(${pcpu}%) thread(${threadId}/${threadId0x}) stack of java process(${pid}) under user(${user})."
                     redPrint "User of java process($user) is not current user($USER), need sudo to run again:"
                     yellowPrint "    sudo ${COMMAND_LINE[@]}"
                     normalPrint
                     continue
                 fi
             } || {
-                redPrint "[$counter] Fail to jstack busy(${pcpu}%) thread(${threadId}/${threadId0x}) stack of java process(${pid}) under user(${user})."
+                redPrint "[$counter] Fail to jstack Busy(${pcpu}%) thread(${threadId}/${threadId0x}) stack of java process(${pid}) under user(${user})."
                 normalPrint
                 rm ${jstackFile}
                 continue
@@ -249,10 +261,34 @@ for ((i = 0; update_count <= 0 || i < update_count; ++i)); do
     [ -n "$append_file" ] && headInfo >> "$append_file"
     [ "$update_count" -ne 1 ] && headInfo
 
-    # use wide output(unlimited width), avoid trunk user column to username_fo+ or $uid alike
-    ps -wwLeo pid,lwp,comm,pcpu,user --no-headers | {
-        [ -z "${pid}" ] &&
-        awk '$3=="java"{print $0}' ||
-        awk -v "pid=${pid}" '$1==pid,$3=="java"{print $0}'
-    } | sort -k4,4 -r -n | head -n "${count}" | printStackOfThreads
+    {
+        if [ -z "${current}" ]; then
+            # explicit width control for user column, avoid trunk to username_fo+ or $uid alike
+            ps -Leo pid,lwp,user:80,comm,pcpu --no-headers | {
+                [ -z "${pid}" ] &&
+                awk '$4=="java"{print $0}' ||
+                awk -v "pid=${pid}" '$1==pid,$4=="java"{print $0}'
+            } | sort -k5 -r -n | head --lines "${count}" 
+        else
+            # XXX no truncate for user column
+            if [ -z "${pid}" ]; then
+                pid_tid_pairs=`ps -Leo pid,spid,comm | awk '{if($3 == "java"){print $1 " " $2}}'`
+                top -d ${cpu_period} -n 2 -b -H | awk 'BEGIN{count=0}{if($1=="top"){count+=1;} if(count>1 && $1 ~ /[0-9]+/){print $0}}' | awk '{if($12 == "java"){printf "%s %s %s %s\n",$1,$2,$12,$9}}' | sort -k4 -r -n | head --lines "${count}" | {
+                    while read line ; do
+                        line_tid=`echo -e $line | awk '{print $1}'`
+                        if [ -z "$line_tid" ]; then
+                            continue
+                        fi
+                        line_pid=`echo -e "$pid_tid_pairs" | grep ${line_tid} | awk '{print $1}'`
+                        if [ -z "$line_pid" ]; then
+                            continue
+                        fi
+                        echo "$line_pid $line"
+                    done
+                }
+            else
+                top -d ${cpu_period} -n 2 -b -H -p ${pid} | awk 'BEGIN{count=0}{if($1=="top"){count+=1;} if(count>1 && $1 ~ /[0-9]+/){print $0}}' | awk '{if($1 ~ /[0-9]+/){printf "%s %s %s %s %s\n",'${pid}',$1,$2,$12,$9}}' | sort -k5 -r -n | head --lines "${count}" 
+            fi
+        fi
+    } | printStackOfThreads    
 done
